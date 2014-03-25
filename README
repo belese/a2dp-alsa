@@ -1,0 +1,164 @@
+Author: James Budiono
+Copyright (C) James Budiono 2013
+License: GNU GPL Version 3 or later.
+=========
+
+This is a proof-of-concept implementation of a2dp-alsa using bluez DBus API.
+It acts as a bluetooth "source", accepts input on stdin to be sent to external bluetooth speaker.
+It acts as a bluetooth "sink", outputs on raw sound on stdout which you can pipe to aplay.
+
+The code lives in a2dp-alsa.c (single file, not refactored yet).
+
+Externals:
+---
+a2dp-codecs.h is from bluez 4.101
+ipc.h is from bluez 4.101
+rtp.h is from bluez 4.101
+sbc.* is from bluez 4.101
+uthash.h is from http://troydhanson.github.io/uthash/
+What else you need to compile: dbus, and of course bluez bluetoothd to run it.
+
+How to use
+==========
+
+As it is configured today, the stdout output is S16_LE, 44.1 kHz, either stereo or mono
+(depending on what the source supports). You can pipe the output to "aplay -f cd" and it should work.
+
+The stdin input is expected to be S16_LE, 44.1 kHz too, either stereo or mono, 
+depending on what the sink support.
+
+Only SBC codec is supported at the moment.
+
+To tell a2dp-alsa as a sink (device streams audio to computer running a2dp):
+- edit /etc/bluetooth/audio.conf and add "source" to "Enable" under [General]
+- remove "Socket" under "Enable" under [General]
+- run "a2dp-alsa --sink | aplay -f cd" (we pipe a2dp's output to aplay, which will output it to computer's speaker)
+- connect your device (many ways of doing it, at the basic level you can do
+  dbus-send --system --dest=org.bluez /org/bluez/[bluetoothd-pid]/hci/dev_XX_XX_XX_XX_XX_XX org.bluez.AudioSource.Connect
+  (where XX_XX_XX_XX_XX_XX is the device's bluetooth address).
+
+To tell a2dp-alsa as a source (streams audio from computer to bluetooth speaker)
+- remove "Socket" under "Enable" under [General]
+- run "audio-source --source | a2dp-alsa --source" where audio-source is a program that will produce raw audio data on stdout,
+  example: "mpg321 --stdout xxx.mp3", or "ffmpeg -i xxx.mp3 -", etc.
+- connect your bluetooth speaker, e.g:
+  dbus-send --system --dest=org.bluez /org/bluez/[bluetoothd-pid]/hci/dev_XX_XX_XX_XX_XX_XX org.bluez.AudioSink.Connect
+  (where XX_XX_XX_XX_XX_XX is the device's bluetooth address).
+
+Two mode of operation for "source":
+1. Running as --run-once will tell a2dp-alsa to quit as soon as stdin is exhausted, it only has effects with --source.
+This is probably what you want if you use it inside asoundrc (bearing in mind that 
+as soon as a2dp-alsa quits, the bluetooth connection is terminated and you will have to re-connect again next time).
+This has the effect of running a2dp-alsa "on-demand".
+ffmpeg works with this, VLC stutters, youtube crash.
+
+---
+pcm.a2dp {
+	type file
+	slave.pcm "null"
+	file "| a2dp-alsa --source --run-once"
+}
+---
+
+2. Or you can run a permanent "a2dp server". Useful if you want to run this together with --sink too.
+First, make a fifo (say mkfifo /tmp/a2dp.fifo), 
+then "a2dp-buffer /tmp/a2dp.fifo | a2dp-alsa --source" 
+Use this asoundrc.
+Run this way, ffmpeg (still) works, VLC works (output to file, set to the fifo), youtube still crash.
+---
+pcm.a2dpfifo {
+	type file
+	slave.pcm "null"
+	file "/tmp/a2dp.fifo"
+}
+---
+
+There is a small utility a2dp-buffer whose job is is to read a pipe and put what
+it has read to stdout. If the pipe is closed, it will re-open again, forever.
+It also tries to buffer the content.
+
+With a2dp-buffer it is possible to run a2dp-alsa as a "A2DP soundserver" accepting
+providing sink and source at the same time, like this:
+"a2dp-buffer /tmp/a2dp.fifo | a2dp-alsa --source --sink | aplay -f cd" 
+(after you have made the fifo). Use the second asoundrc above for settings.
+
+How it works
+============
+1. Media.RegisterEndpoint (UUID as A2DP Sink or Source)
+
+2. When somebody attempt connection / streaming, bluez will:
+   - call MediaEndpoint.SelectConfiguration, then
+   - call MediaEndpoint.SetConfiguration
+     == during SetConfiguration, store the given transport_path
+        (in our case, we also create I/O thread, but leave it as idle)
+     
+3. Then bluez will issue AudioSource (or AudioSink) PropertyChange
+   when stream is connected.
+   
+   For AudioSource (bt sink: bt --> alsa),
+   we find the transition from "connected" to "playing" and then we call MediaTransport.Acquire 
+   (using the saved transport_path) to get the descriptors, then we tell our thread to start
+   streaming.
+   If the transition is "playing" --> "connected", we stop streaming and release transport.
+   
+   For AudioSink (bt source: alsa --> bt),
+   we are in charge of the transmission. Only when we acquire the state will change to "playing"
+   so we can't wait for it. Instead, we wait for transition from "disconnected" to "connected" and
+   then we acquire the transport. 
+   We stop streaming and release the transport if we detect "connected" --> "disconnected" transition.
+   
+   Note: In bluez 5, AudioSource/Sink PropertyChange will be replaced by org.freedesktop.Properties.PropertyChanged.
+   for arg=org.bluez.MediaTransport1.
+   
+   bluez also have TryAcquire which only makes sense for "bt source" above - if the device is not already connected,
+   it will not connect. Acquire will *always* make a connection when possible.
+   
+4. During streaming:   
+   Read/write the fd as required.
+   Data format is RTP --> RTP header + RTP payload.
+   RTP payload depends on codec, for SBC it is SBC-header + SBC frame(s).
+   
+5. When one of the party disconnects, bluez will issue:
+   - MediaEndpoint.ClearConfiguration
+     == stop streaming from here onwards, immediate
+        (kill our I/O thread).
+        
+6. MediaEndpoint.Release will be called when bluez wants us to shutdown.
+   Do our own cleanup, no need to de-register etc.
+   (stop all I/O threads, then quit)
+
+That's it! The process is the same for either Sink or Source.
+
+
+TODO:
+======
+
+1. It can act as sink and/or source.
+   But using it both as sink/source at the same time, somehow causes output
+   streaming (from computer to bluetooth speaker) to stutter - need to investigate.
+   
+2. Minimal error checking (purpose is to show how it works).
+
+3. Will work with multiple bt devices connected but look - there is only one input
+   (stdin) and output (stdout). You can make it work as a simple router 
+   (bt phone --> (sink) computer (source) --> bt speaker) by piping
+   sink's output to source's fifo, like this:
+   
+   "a2dp-buffer /tmp/a2dp.fifo | a2dp-alsa --source --sink | aplay -f cd -D a2dpfifo"
+   
+   but because of problem no. 1 above, streaming is not very smooth.
+   
+4. Now only works on bluez 4.x (4.101 tested), may need to refactor to work on bluez 5.
+   The biggest stud: the org.bluez.AudioSource / org.bluez.AudioSink signals are gone so 
+   we need another way to know when we can Acquire the transport, supposedly as noted above.
+
+What can be improved:
+- check why running both input and output causes output to stutter.
+- handle device changes - auto-detect new devices and auto-shutdown on removal.
+- merge a2dp-buffer with bt_write
+- make an alsa-library driver for it (like pcm_bluetooth, which is removed in bluez 5),
+  instead of the kludge with alsa 'file' plugin as above.
+- make it bluez 5 capable. Note that at this time of writing, June 2013, bluez has been 
+  on the wild for 6 months, the API keeps changing, and even pulseaudio - the biggest
+  supporter of bluez, still hasn't supported bluez 5.
+- etc.
